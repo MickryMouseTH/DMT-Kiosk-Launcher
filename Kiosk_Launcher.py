@@ -2,6 +2,7 @@
 # Python Kiosk Launcher for Win32 exe (Windows Pro)
 # Dependencies: pywin32, psutil, keyboard
 # Run as Administrator for best results
+
 from LogLibrary import Load_Config, Loguru_Logging
 import win32process
 import subprocess
@@ -18,7 +19,7 @@ import sys
 
 # ---------------- App Config ----------------
 Program_Name = "Kiosk_Launcher"
-Program_Version = "1.3"
+Program_Version = "1.4"  # [OPT] bumped minor version
 
 default_config = {
     "EXE_Path":"",
@@ -48,7 +49,10 @@ _target_proc = None
 _target_pid = None
 _target_hwnd = None
 _running = True
-_altf4_handler = None
+
+# [OPT] state for debounce/adaptive behavior
+_last_refocus_ts = 0.0
+REFOCUS_COOLDOWN = 0.5  # seconds to wait before pulling focus back
 
 # --- Process termination helper ---
 def terminate_target(grace_seconds: float = 3.0):
@@ -131,6 +135,15 @@ def is_admin():
     except Exception:
         return False
 
+# [OPT] helper to check topmost status
+
+def _is_topmost(hwnd):
+    try:
+        exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        return bool(exstyle & win32con.WS_EX_TOPMOST)
+    except Exception:
+        return False
+
 # ---------- Start target (with elevation fallback) ----------
 def _start_target_elevated_shell():
     """Open EXE with UAC prompt (runas)."""
@@ -155,7 +168,7 @@ def _start_target_elevated_shell():
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
         if pid is None:
-            time.sleep(0.2)
+            time.sleep(0.5)  # [OPT] reduce scan frequency
     return pid
 
 def start_target():
@@ -232,27 +245,30 @@ def find_hwnd_by_pid(pid, timeout=8.0):
 
 # ---------- Fullscreen + TopMost ----------
 def make_window_fullscreen(hwnd):
-    """Borderless fullscreen + TOPMOST on primary monitor."""
+    """Borderless fullscreen + TOPMOST on primary monitor (do only if needed)."""
     if not hwnd or not win32gui.IsWindow(hwnd):
         return False
     try:
+        # Only change style if it still has window chrome
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-        new_style = style & ~(win32con.WS_CAPTION | win32con.WS_SYSMENU | win32con.WS_THICKFRAME |
-                              win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX)
-        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, new_style)
+        mask = (win32con.WS_CAPTION | win32con.WS_SYSMENU |
+                win32con.WS_THICKFRAME | win32con.WS_MINIMIZEBOX | win32con.WS_MAXIMIZEBOX)
+        if style & mask:
+            win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style & ~mask)
     except Exception as e:
         logger.error(f"[kiosk] SetWindowLong failed: {e}")
 
     try:
-        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
-        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-        # TOPMOST to resist Win+D / focus steal
-        win32gui.SetWindowPos(
-            hwnd,
-            win32con.HWND_TOPMOST,
-            0, 0, screen_w, screen_h,
-            win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW
-        )
+        # Resize & topmost only if not already topmost
+        if not _is_topmost(hwnd):
+            screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+            screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0, 0, screen_w, screen_h,
+                win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW
+            )
         try:
             win32gui.SetForegroundWindow(hwnd)
         except Exception:
@@ -266,6 +282,7 @@ def make_window_fullscreen(hwnd):
     except Exception as e:
         logger.error(f"[kiosk] SetWindowPos failed: {e}")
         return False
+
 
 def restore_window_style(hwnd):
     try:
@@ -305,15 +322,20 @@ def block_hotkeys_when_target_active():
     # low-level listener with conditional suppression when any target-owned window is foreground
     def low_level_listener(e):
         try:
-            name = (e.name or '').lower()
             if e.event_type != 'down':
                 return True
+            name = (e.name or '').lower()
 
             # --- Whitelist Numpad: always allow ---
             if name in NUMPAD_NAMES:
                 return True
 
-            active_ok = False
+            # read modifiers once per event [OPT]
+            alt_down = keyboard.is_pressed('alt')
+            ctrl_down = keyboard.is_pressed('ctrl')
+            win_down = keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows')
+
+            # is active our process?
             try:
                 fg = win32gui.GetForegroundWindow()
                 active_ok = (_get_pid_of_hwnd(fg) == _target_pid)
@@ -321,34 +343,28 @@ def block_hotkeys_when_target_active():
                 active_ok = False
 
             # Alt+F4
-            if name == 'f4' and keyboard.is_pressed('alt') and active_ok:
-                logger.debug("[kiosk] Suppressing Alt+F4")
+            if name == 'f4' and alt_down and active_ok:
+                # logger.debug("[kiosk] Suppressing Alt+F4")  # keep silent to reduce log I/O
                 return False
 
             # Ctrl+W / Cmd+W
-            if name == 'w' and (keyboard.is_pressed('ctrl') or keyboard.is_pressed('command')) and active_ok:
-                logger.debug("[kiosk] Suppressing Ctrl+W")
+            if name == 'w' and (ctrl_down or keyboard.is_pressed('command')) and active_ok:
                 return False
 
             # Ctrl+Esc (Start menu)
-            if name == 'esc' and keyboard.is_pressed('ctrl'):
-                logger.debug("[kiosk] Suppressing Ctrl+Esc")
+            if name == 'esc' and ctrl_down:
                 return False
 
             # Best-effort: Alt+Tab (not guaranteed)
-            if name == 'tab' and keyboard.is_pressed('alt') and active_ok:
-                logger.debug("[kiosk] Attempting to suppress Alt+Tab")
+            if name == 'tab' and alt_down and active_ok:
                 return False
 
             # Win+ combos — rely on left/right windows pressed
-            if name in ('d','e','x','r','tab') and (
-                keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows')
-            ):
-                logger.debug("[kiosk] Suppressing Win+ combo")
+            if name in ('d','e','x','r','tab') and win_down:
                 return False
 
             # Ctrl+Alt+Del is SAS -> cannot be reliably blocked (log only)
-            if name == 'delete' and keyboard.is_pressed('ctrl') and keyboard.is_pressed('alt'):
+            if name == 'delete' and ctrl_down and keyboard.is_pressed('alt'):
                 logger.debug("[kiosk] CAD detected (cannot block in user-mode)")
                 return True
 
@@ -381,7 +397,7 @@ def emergency_stop_listener():
 
 # ---------- Monitor loop ----------
 def monitor_loop():
-    global _target_proc, _target_pid, _target_hwnd, _running, _altf4_handler
+    global _target_proc, _target_pid, _target_hwnd, _running, _last_refocus_ts
 
     block_hotkeys_when_target_active()
     emergency_stop_listener()
@@ -399,55 +415,52 @@ def monitor_loop():
             hwnd = find_hwnd_by_pid(_target_pid, timeout=8.0)
             _target_hwnd = hwnd
             if hwnd:
-                make_window_fullscreen(hwnd)
+                make_window_fullscreen(hwnd)  # [OPT] call only once per fresh hwnd
             else:
                 logger.warning(f"[kiosk] could not find window for pid={_target_pid}")
         else:
-            # keep window on top & focused
+            # keep window on top & focused (lighter touch)
             if _target_hwnd and win32gui.IsWindow(_target_hwnd):
                 try:
+                    now = time.time()
                     fg = win32gui.GetForegroundWindow()
                     fg_pid = _get_pid_of_hwnd(fg)
 
                     if fg_pid == _target_pid:
                         # A popup/dialog from the same target app is in front -> allow it.
                         if fg and fg != _target_hwnd and win32gui.IsWindow(fg):
-                            # Make sure the dialog stays above the main window.
-                            try:
-                                win32gui.SetWindowPos(_target_hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
-                                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
-                            except Exception:
-                                pass
-                            try:
-                                win32gui.SetWindowPos(fg, win32con.HWND_TOPMOST, 0, 0, 0, 0,
-                                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
-                            except Exception:
-                                pass
+                            # Make sure the dialog stays above the main window (only if needed)
+                            if not _is_topmost(fg):
+                                try:
+                                    win32gui.SetWindowPos(fg, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                                         win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+                                except Exception:
+                                    pass
                             ensure_numlock_on()
-                        # Do nothing else; let the app handle its own popups.
+                        # else: do nothing; let the app handle its own popups.
                     else:
-                        # Foreground belongs to another process -> pull our app back.
-                        try:
-                            # Reassert main as topmost and refocus
-                            win32gui.SetWindowPos(
-                                _target_hwnd, win32con.HWND_TOPMOST,
-                                0, 0, 0, 0,
-                                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            win32gui.SetForegroundWindow(_target_hwnd)
-                            ensure_numlock_on()
-                        except Exception:
-                            pass
-                        logger.debug("[kiosk] Re-topmost & refocused target")
-                except Exception as e:
-                    logger.debug(f"[kiosk] Foreground check failed: {e}")
+                        # Foreground belongs to another process -> pull our app back (debounced)
+                        if (now - _last_refocus_ts) >= REFOCUS_COOLDOWN:
+                            try:
+                                if not _is_topmost(_target_hwnd):
+                                    win32gui.SetWindowPos(
+                                        _target_hwnd, win32con.HWND_TOPMOST,
+                                        0, 0, 0, 0,
+                                        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+                                    )
+                            except Exception:
+                                pass
+                            try:
+                                win32gui.SetForegroundWindow(_target_hwnd)
+                                ensure_numlock_on()
+                            except Exception:
+                                pass
+                            logger.debug("[kiosk] Re-topmost & refocused target (debounced)")
+                            _last_refocus_ts = now
                 except Exception as e:
                     logger.debug(f"[kiosk] Foreground check failed: {e}")
             else:
-                # try to locate window again
+                # try to locate window again (short timeout)
                 try:
                     hwnd = find_hwnd_by_pid(_target_pid, timeout=1.0)
                     _target_hwnd = hwnd
@@ -458,7 +471,7 @@ def monitor_loop():
                 except Exception as e:
                     logger.debug(f"[kiosk] find_hwnd_by_pid error: {e}")
 
-        # liveness
+        # liveness & pacing
         if _target_proc:
             if _target_proc.poll() is not None:
                 logger.info(f"[kiosk] Target process exited. Restarting in {RESTART_DELAY} s")
@@ -467,7 +480,14 @@ def monitor_loop():
                 _target_hwnd = None
                 time.sleep(RESTART_DELAY)
             else:
-                time.sleep(WATCH_INTERVAL)
+                # [OPT] adaptive sleep: back off a bit when stable (target has focus)
+                try:
+                    fg = win32gui.GetForegroundWindow()
+                    fg_pid = _get_pid_of_hwnd(fg)
+                except Exception:
+                    fg_pid = None
+                stable_sleep = WATCH_INTERVAL if fg_pid != _target_pid else max(WATCH_INTERVAL, 1.5)
+                time.sleep(stable_sleep)
         else:
             time.sleep(WATCH_INTERVAL)
 
