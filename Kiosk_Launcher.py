@@ -33,47 +33,6 @@ default_config = {
 config = Load_Config(default_config, Program_Name)
 logger = Loguru_Logging(config, Program_Name, Program_Version)
 
-"""
-===============================================================================
-Kiosk Launcher v1.3 — Logging & Flow Overview
-===============================================================================
-วัตถุประสงค์:
-- รันโปรแกรมเป้าหมาย (EXE) แบบคีออสค์, ทำให้เต็มจอ/บนสุด, ป้องกันคีย์ลัดออกนอกระบบ
-- เฝ้ากระบวนการ หากล้มเหลวให้สตาร์ตใหม่อัตโนมัติ
-- รองรับปุ่มฉุกเฉินเพื่อปิดคีออสค์และปิดโปรแกรมเป้าหมายทั้งหมดอย่างปลอดภัย
-- อนุญาตให้ป็อปอัป/ไดอะล็อกของโปรแกรมใช้งานได้ตามปกติ
-- รองรับ Numpad โดยบังคับเปิด NumLock และ whitelist ปุ่ม Numpad
-
-การทำงานของระบบ Log (อาศัย LogLibrary.Loguru_Logging):
-- คอนฟิกผ่านไฟล์ (โหลดด้วย Load_Config) โดยคีย์สำคัญใน default_config:
-  - log_Level: ระดับล็อก (เช่น DEBUG/INFO/WARNING/ERROR)
-  - Log_Console: แสดงบนคอนโซล (1=เปิด, 0=ปิด)
-  - log_Backup: จำนวนวันเก็บรักษา (retention)
-  - Log_Size: ขนาดไฟล์สูงสุดก่อนหมุนเวียน (rotation) เช่น "100 MB"
-- ตัว logger ที่สร้างจาก Loguru_Logging จะเซ็ต sink สำหรับไฟล์/คอนโซลให้เองตาม config
-- ข้อความล็อกที่สำคัญ:
-  - INFO: เหตุการณ์ปกติของวงจรชีวิต เช่น เริ่ม/หยุด, เริ่มโปรเซส, รีสตาร์ต, fullscreen สำเร็จ
-  - DEBUG: ระดับละเอียด ใช้ติดตามสถานะ foreground, การ hook คีย์, บังคับ NumLock, รายละเอียด refocus
-  - WARNING: เหตุการณ์ที่อาจกระทบการทำงาน เช่น ไม่ได้รันเป็น Administrator, บังคับ kill กระบวนการ
-  - ERROR: ความผิดพลาดเช่น เปิด EXE ไม่ได้, หา window ไม่เจอภายในเวลาที่กำหนด, set window style ล้มเหลว
-
-ตำแหน่งสำคัญที่มีการล็อก:
-- start_target(): บันทึกการเริ่มโปรเซส (pid), กรณียกระดับสิทธิ (runas) และความล้มเหลว
-- make_window_fullscreen(): รายงานผลการตั้งค่าสไตล์/ขนาด/ลำดับหน้าต่าง
-- block_hotkeys_when_target_active(): รายงานการลง hook และกุญแจที่บล็อก
-- monitor_loop(): รายงานเมื่อสลับโฟกัส, เมื่อโปรเซสล้ม/รีสตาร์ต, และสถานะค้นหา hwnd
-- terminate_target(): รายงานขั้นตอนปิดโปรแกรม (WM_CLOSE -> terminate tree -> kill)
-- emergency_stop_listener(): รายงานการกดปุ่มฉุกเฉินและการคืนสภาพหน้าต่าง
-
-ทิศทางการไล่ปัญหา (ดูที่ระดับ DEBUG ก่อน):
-1) ตรวจว่าเริ่มโปรเซสและ pid ถูกต้อง ("Started pid=...")
-2) ตรวจการหา hwnd และการทำ fullscreen ("Window set to fullscreen ...")
-3) ดู hook คีย์/whitelist ("Key hooks registered ...")
-4) กรณี popup ไม่ขึ้น ให้ดู fg_pid เทียบ _target_pid ในบล็อก refocus
-5) กรณีปิดไม่สนิท ให้ดูลอกรอบ terminate_target()
-
-"""
-
 # ---------- CONFIG ----------
 EXE_PATH = config.get('EXE_Path', '').strip()
 if not EXE_PATH or not os.path.isfile(EXE_PATH):
