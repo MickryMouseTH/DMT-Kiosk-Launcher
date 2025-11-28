@@ -3,7 +3,7 @@ import json
 import sys
 import os
 
-'''
+"""
 # To use the Log Library, first import the necessary functions:
 # 'Load_Config' for loading configuration settings.
 # 'Loguru_Logging' for initializing the logger.
@@ -36,50 +36,52 @@ default_config = {
 
 config = Load_Config(default_config, Program_Name, script_dir)
 logger = Loguru_Logging(config, Program_Name, Program_Version, script_dir)
-'''
+"""
 global script_dir
 
-if getattr(sys, 'frozen', False):
+if getattr(sys, "frozen", False):
     script_dir = os.path.dirname(sys.executable)
 else:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-def Load_Config(default_config,Program_Name):
+
+def Load_Config(default_config, Program_Name):
     # Define the configuration file path.
-    config_file_name = f'{Program_Name}_config.json'
+    config_file_name = f"{Program_Name}_config.json"
     config_path = os.path.join(script_dir, config_file_name)
 
     # Create config file with default values if it does not exist.
     if not os.path.exists(config_path):
-        default_config = default_config 
-        with open(config_path, 'w') as new_config_file:
+        default_config = default_config
+        with open(config_path, "w") as new_config_file:
             json.dump(default_config, new_config_file, indent=4)
 
     # Load configuration
-    with open(config_path, 'r') as config_file:
+    with open(config_path, "r") as config_file:
         config = json.load(config_file)
-    
+
     return config
 
+
 # ----------------------- Loguru Logging Setup -----------------------
-def Loguru_Logging(config,Program_Name,Program_Version):
+def Loguru_Logging(config, Program_Name, Program_Version):
     logger.remove()
 
-    log_Backup = int(config.get('log_Backup', 90))
-    Log_Size = config.get('Log_Size', '10 MB').upper()
-    log_Level = config.get('log_Level', 'DEBUG').upper()
+    log_Backup = int(config.get("log_Backup", 90))
+    Log_Size = config.get("Log_Size", "10 MB").upper()
+    log_Level = config.get("log_Level", "DEBUG").upper()
 
-    log_dir = os.path.join(script_dir, 'logs')
+    log_dir = os.path.join(script_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
-    log_file_name = f'{Program_Name}_{Program_Version}.log'
+    log_file_name = f"{Program_Name}_{Program_Version}.log"
     log_file = os.path.join(log_dir, log_file_name)
 
-    if config.get('Log_Console', 0) == 1:
+    if config.get("Log_Console", 0) == 1:
         logger.add(
-            sys.stdout, 
-            level=log_Level, 
-            format="<green>{time}</green> | <blue>{level}</blue> | <cyan>{thread.id}</cyan> | <magenta>{function}</magenta> | {message}"
+            sys.stdout,
+            level=log_Level,
+            format="<green>{time}</green> | <blue>{level}</blue> | <cyan>{thread.id}</cyan> | <magenta>{function}</magenta> | {message}",
         )
 
     logger.add(
@@ -88,13 +90,13 @@ def Loguru_Logging(config,Program_Name,Program_Version):
         level=log_Level,
         rotation=Log_Size,
         retention=f"{log_Backup} days",
-        compression="zip"
+        compression="zip",
     )
 
-    logger.info('-' * 117)
-    logger.info('')
+    logger.info("-" * 117)
+    logger.info("")
     logger.info(f"Start {Program_Name} Version {Program_Version}")
-    logger.info('')
-    logger.info('-' * 117)
+    logger.info("")
+    logger.info("-" * 117)
 
     return logger
