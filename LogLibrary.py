@@ -84,7 +84,9 @@ def Loguru_Logging(config, Program_Name, Program_Version):
     log_file_name = f"{Program_Name}_{Program_Version}.log"
     log_file = os.path.join(log_dir, log_file_name)
 
-    if config.get("Log_Console", 0) == 1:
+    # Guard sys.stdout: a windowed (no-console) PyInstaller exe has
+    # sys.stdout = None and logger.add(None) would crash at startup.
+    if config.get("Log_Console", 0) == 1 and sys.stdout is not None:
         logger.add(
             sys.stdout,
             level=log_Level,

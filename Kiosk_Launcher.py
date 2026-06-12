@@ -57,7 +57,7 @@ def verify_password(plain, stored):
 
 # ---------------- App Config ----------------
 Program_Name = "Kiosk_Launcher"
-Program_Version = "2.1"
+Program_Version = "2.2"
 
 default_config = {
     "EXE_Path": "",
@@ -66,6 +66,12 @@ default_config = {
     # auto-converts it to a salted one-way hash and rewrites this field.
     "EXIT_Password": "",
     "Watch_Interval": 1.0,
+    # Recovery chord: hold ALL these keys at once to force-exit WITHOUT the
+    # password (last resort if the password is lost). Default = 1 2 3 4 7 8 9 0 f h.
+    # NOTE: most keyboards can't register 10 keys at once (key rollover/ghosting)
+    #       — test on the real kiosk keyboard and trim the list if it won't trigger.
+    "Recovery_Enabled": 1,
+    "Recovery_Combo": ["1", "2", "3", "4", "7", "8", "9", "0", "f", "h"],
     "log_Level": "DEBUG",
     "Log_Console": 1,
     "log_Backup": 90,
@@ -115,6 +121,16 @@ if not EXE_PATH or not os.path.isfile(EXE_PATH):
     sys.exit(1)
 RESTART_DELAY = float(config.get('Restart_Delay', 2))
 WATCH_INTERVAL = float(config.get('Watch_Interval', 1.0))
+
+# Recovery chord (forgot-password last resort) — normalized to a lowercase set
+RECOVERY_ENABLED = int(config.get('Recovery_Enabled', 1)) == 1
+RECOVERY_COMBO = (
+    {str(k).strip().lower() for k in config.get('Recovery_Combo', []) if str(k).strip()}
+    if RECOVERY_ENABLED else set()
+)
+if RECOVERY_COMBO:
+    logger.info(f"[kiosk] Recovery chord enabled ({len(RECOVERY_COMBO)} keys): "
+                f"{'+'.join(sorted(RECOVERY_COMBO))}")
 # ----------------------------
 
 # Globals
@@ -134,6 +150,10 @@ _state_lock = threading.RLock()
 # Emergency-exit coordination: keyboard thread signals, MAIN thread runs Tk (M4)
 _emergency_request = threading.Event()
 _dialog_open = False  # re-entrancy guard for the password dialog (H2)
+
+# Recovery chord state (forgot-password last resort)
+_pressed_keys = set()        # physical keys currently held (tracked by the hook)
+_recovery_triggered = False  # one-shot guard so the chord fires exactly once
 
 # --- Process termination helper ---
 def terminate_target(grace_seconds: float = 3.0):
@@ -451,10 +471,25 @@ def block_hotkeys_when_target_active():
 
     # low-level listener with conditional suppression when any target-owned window is foreground
     def low_level_listener(e):
+        global _recovery_triggered
         try:
             name = (e.name or '').lower()
+
+            # --- Track held keys + detect the recovery chord (works in ANY mode) ---
+            if e.event_type == 'up':
+                _pressed_keys.discard(name)
+                return True
             if e.event_type != 'down':
                 return True
+            _pressed_keys.add(name)
+            if (RECOVERY_COMBO and not _recovery_triggered
+                    and RECOVERY_COMBO.issubset(_pressed_keys)):
+                _recovery_triggered = True
+                logger.critical(f"[kiosk] Recovery chord detected: "
+                                f"{'+'.join(sorted(RECOVERY_COMBO))}")
+                # Run the exit off the hook thread so we don't block input.
+                threading.Thread(target=do_recovery_exit, daemon=True).start()
+                return True  # don't swallow the keys; we're shutting down anyway
 
             if _monitor_paused:
                 # Password dialog open: let ALL typing through so the operator
@@ -641,14 +676,34 @@ def show_fullscreen_password_dialog():
     dialog.bind("<Escape>", cancel_dialog)
 
     def continuous_lift():
-        if dialog.winfo_exists():
-            dialog.lift()
-            dialog.attributes("-topmost", True)
-            dialog._refocus_job = root.after(100, continuous_lift)
+        if not dialog.winfo_exists():
+            return
+        # If the recovery chord fired while this dialog is open, _running drops
+        # to False -> close ourselves so mainloop() returns and the app exits.
+        if not _running:
+            close_dialog()
+            return
+        dialog.lift()
+        dialog.attributes("-topmost", True)
+        dialog._refocus_job = root.after(100, continuous_lift)
 
     dialog._refocus_job = root.after(100, continuous_lift)
     root.mainloop()
     return input_attempt
+
+
+def do_recovery_exit():
+    """Force-exit the kiosk WITHOUT a password (recovery chord). Safe to call
+    from the keyboard thread: it touches only win32/psutil, never Tkinter."""
+    global _running
+    logger.critical("[kiosk] RECOVERY CHORD accepted — exiting kiosk WITHOUT password.")
+    _running = False
+    try:
+        if _target_hwnd:
+            restore_window_style(_target_hwnd)
+        terminate_target(grace_seconds=3.0)
+    except Exception as e:
+        logger.debug(f"[kiosk] recovery cleanup failed: {e}")
 
 
 def handle_emergency():

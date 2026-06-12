@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 logs/
 Kiosk_Launcher_config.json
+
+# PyInstaller build output
+build/
+dist/

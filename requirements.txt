@@ -1,0 +1,5 @@
+pywin32>=306
+psutil>=5.9
+keyboard>=0.13.5
+loguru>=0.7
+pyinstaller>=6.0
