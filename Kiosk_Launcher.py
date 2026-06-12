@@ -57,7 +57,7 @@ def verify_password(plain, stored):
 
 # ---------------- App Config ----------------
 Program_Name = "Kiosk_Launcher"
-Program_Version = "2.0"
+Program_Version = "2.1"
 
 default_config = {
     "EXE_Path": "",
@@ -124,6 +124,10 @@ _target_hwnd = None
 _running = True
 _monitor_paused = False
 _original_target_topmost = False
+
+# PIDs of the target process AND all its descendants (children/grandchildren).
+# Refreshed by the monitor loop; read lock-free by the keyboard hook (W1).
+_target_family_pids = set()
 
 # Synchronization for shared state accessed by monitor thread + main thread (M3)
 _state_lock = threading.RLock()
@@ -343,6 +347,24 @@ def find_hwnd_by_pid(pid, timeout=8.0):
         time.sleep(0.2)
     return hwnd_found
 
+def force_foreground(hwnd):
+    """SetForegroundWindow with the ALT-key workaround (W4).
+    Windows' foreground-lock often rejects focus steals from a background
+    process; simulating an ALT press satisfies the foreground-change rules."""
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        pass
+    try:
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except Exception as e:
+        logger.debug(f"[kiosk] force_foreground failed: {e}")
+        return False
+
 def make_window_fullscreen(hwnd):
     """Borderless fullscreen + TOPMOST on primary monitor."""
     if not hwnd or not win32gui.IsWindow(hwnd):
@@ -364,10 +386,7 @@ def make_window_fullscreen(hwnd):
             0, 0, screen_w, screen_h,
             win32con.SWP_FRAMECHANGED | win32con.SWP_SHOWWINDOW
         )
-        try:
-            win32gui.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
+        force_foreground(hwnd)
 
         # Ensure NumLock ON whenever we claim focus/fullscreen
         ensure_numlock_on()
@@ -398,6 +417,26 @@ def _get_pid_of_hwnd(hwnd):
         return None
 
 
+def refresh_target_family():
+    """Rebuild the cached set of PIDs in the target's process tree (W1).
+    Popups/dialogs spawned by the target as CHILD PROCESSES must be treated
+    as part of the kiosk app — not as foreign windows to fight with.
+    Called once per monitor iteration; the hook reads the set lock-free
+    (whole-set replacement is atomic under the GIL)."""
+    global _target_family_pids
+    pid = _target_pid
+    if pid is None:
+        _target_family_pids = set()
+        return
+    fam = {pid}
+    try:
+        for c in psutil.Process(pid).children(recursive=True):
+            fam.add(c.pid)
+    except psutil.Error:
+        pass
+    _target_family_pids = fam
+
+
 def block_hotkeys_when_target_active():
     """Block Alt+F4, Ctrl+W, Windows keys, Ctrl+Esc; best-effort Alt+Tab when target focused."""
     logger.debug("[kiosk] Hotkey blocker started.")
@@ -412,26 +451,42 @@ def block_hotkeys_when_target_active():
 
     # low-level listener with conditional suppression when any target-owned window is foreground
     def low_level_listener(e):
-        global _monitor_paused # <<<--- Access global state
-        
-        # *** FIX: If paused (password screen is active), allow all keyboard input ***
-        if _monitor_paused:
-            return True
-        # **************************************************************************
-
         try:
             name = (e.name or '').lower()
             if e.event_type != 'down':
+                return True
+
+            if _monitor_paused:
+                # Password dialog open: let ALL typing through so the operator
+                # can enter the password — but STILL suppress window-switch
+                # combos, otherwise Ctrl+Alt+Q then Alt+Tab escapes the kiosk
+                # without any password (W3).
+                if name == 'tab' and keyboard.is_pressed('alt'):
+                    return False
+                if name == 'esc' and (keyboard.is_pressed('alt') or keyboard.is_pressed('ctrl')):
+                    return False
                 return True
 
             # --- Whitelist Numpad: always allow ---
             if name in NUMPAD_NAMES:
                 return True
 
+            # Window/desktop switch combos -> ALWAYS suppress in kiosk mode:
+            #   Alt+Tab, Ctrl+Alt+Tab (switcher) / Alt+Esc (next window, W2)
+            #   Ctrl+Esc (Start menu) / Ctrl+Shift+Esc (Task Manager — same rule)
+            if name == 'tab' and keyboard.is_pressed('alt'):
+                logger.debug("[kiosk] Suppressing Alt+Tab")
+                return False
+            if name == 'esc' and (keyboard.is_pressed('alt') or keyboard.is_pressed('ctrl')):
+                logger.debug("[kiosk] Suppressing Alt/Ctrl(+Shift)+Esc")
+                return False
+
+            # App-close combos -> suppress when any kiosk-family window is
+            # foreground (target OR its child processes — W1)
             active_ok = False
             try:
                 fg = win32gui.GetForegroundWindow()
-                active_ok = (_get_pid_of_hwnd(fg) == _target_pid)
+                active_ok = (_get_pid_of_hwnd(fg) in _target_family_pids)
             except Exception:
                 active_ok = False
 
@@ -440,22 +495,13 @@ def block_hotkeys_when_target_active():
                 logger.debug("[kiosk] Suppressing Alt+F4")
                 return False
 
-            # Ctrl+W / Cmd+W
-            if name == 'w' and (keyboard.is_pressed('ctrl') or keyboard.is_pressed('command')) and active_ok:
+            # Ctrl+W
+            if name == 'w' and keyboard.is_pressed('ctrl') and active_ok:
                 logger.debug("[kiosk] Suppressing Ctrl+W")
                 return False
 
-            # Ctrl+Esc (Start menu)
-            if name == 'esc' and keyboard.is_pressed('ctrl'):
-                logger.debug("[kiosk] Suppressing Ctrl+Esc")
-                return False
-
-            # Best-effort: Alt+Tab (not guaranteed)
-            if name == 'tab' and keyboard.is_pressed('alt') and active_ok:
-                logger.debug("[kiosk] Attempting to suppress Alt+Tab")
-                return False
-
-            # Win+ combos — rely on left/right windows pressed
+            # Win+ combos — backup only; the Windows keys themselves are
+            # hard-blocked above so these should never be reachable
             if name in ('d','e','x','r','tab') and (
                 keyboard.is_pressed('left windows') or keyboard.is_pressed('right windows')
             ):
@@ -686,6 +732,10 @@ def monitor_loop():
             time.sleep(0.1)
             continue
 
+        # Keep the target process-tree PID cache fresh (used here and by the
+        # keyboard hook to recognize the app's own child-process popups — W1)
+        refresh_target_family()
+
         if _target_proc is None or (_target_proc and _target_proc.poll() is not None):
             p = start_target()
             if p is None:
@@ -708,8 +758,9 @@ def monitor_loop():
                     fg = win32gui.GetForegroundWindow()
                     fg_pid = _get_pid_of_hwnd(fg)
 
-                    if fg_pid == _target_pid:
-                        # A popup/dialog from the same target app is in front -> allow it.
+                    if fg_pid and fg_pid in _target_family_pids:
+                        # A popup/dialog from the kiosk app (same process OR a
+                        # child process it spawned) is in front -> allow it (W1).
                         if fg and fg != _target_hwnd and win32gui.IsWindow(fg):
                             # Make sure the dialog stays above the main window.
                             try:
@@ -733,11 +784,8 @@ def monitor_loop():
                             )
                         except Exception:
                             pass
-                        try:
-                            win32gui.SetForegroundWindow(_target_hwnd)
-                            ensure_numlock_on()
-                        except Exception:
-                            pass
+                        force_foreground(_target_hwnd)
+                        ensure_numlock_on()
                         logger.debug("[kiosk] Re-topmost & refocused target")
                 except Exception as e:
                     logger.debug(f"[kiosk] Foreground check failed: {e}")
