@@ -34,11 +34,9 @@ default_config = {
             "Log_Size": "10 MB"       # Maximum log file size before rotation. 
         }
 
-config = Load_Config(default_config, Program_Name, script_dir)
-logger = Loguru_Logging(config, Program_Name, Program_Version, script_dir)
+config = Load_Config(default_config, Program_Name)
+logger = Loguru_Logging(config, Program_Name, Program_Version)
 """
-global script_dir
-
 if getattr(sys, "frozen", False):
     script_dir = os.path.dirname(sys.executable)
 else:
@@ -61,6 +59,15 @@ def Load_Config(default_config, Program_Name):
         config = json.load(config_file)
 
     return config
+
+
+def Save_Config(config, Program_Name):
+    """Persist the config dict back to its JSON file (same path as Load_Config)."""
+    config_file_name = f"{Program_Name}_config.json"
+    config_path = os.path.join(script_dir, config_file_name)
+    with open(config_path, "w") as config_file:
+        json.dump(config, config_file, indent=4)
+    return config_path
 
 
 # ----------------------- Loguru Logging Setup -----------------------
