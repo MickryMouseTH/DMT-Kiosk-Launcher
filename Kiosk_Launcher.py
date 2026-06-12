@@ -57,7 +57,7 @@ def verify_password(plain, stored):
 
 # ---------------- App Config ----------------
 Program_Name = "Kiosk_Launcher"
-Program_Version = "2.2"
+Program_Version = "2.3"
 
 default_config = {
     "EXE_Path": "",
@@ -123,9 +123,15 @@ RESTART_DELAY = float(config.get('Restart_Delay', 2))
 WATCH_INTERVAL = float(config.get('Watch_Interval', 1.0))
 
 # Recovery chord (forgot-password last resort) — normalized to a lowercase set
-RECOVERY_ENABLED = int(config.get('Recovery_Enabled', 1)) == 1
+try:
+    RECOVERY_ENABLED = int(config.get('Recovery_Enabled', 1)) == 1
+except (TypeError, ValueError):
+    RECOVERY_ENABLED = True  # default ON if the config value is malformed
+_recovery_cfg = config.get('Recovery_Combo', [])
+if not isinstance(_recovery_cfg, list):
+    _recovery_cfg = []
 RECOVERY_COMBO = (
-    {str(k).strip().lower() for k in config.get('Recovery_Combo', []) if str(k).strip()}
+    {str(k).strip().lower() for k in _recovery_cfg if str(k).strip()}
     if RECOVERY_ENABLED else set()
 )
 if RECOVERY_COMBO:
@@ -695,8 +701,11 @@ def show_fullscreen_password_dialog():
 def do_recovery_exit():
     """Force-exit the kiosk WITHOUT a password (recovery chord). Safe to call
     from the keyboard thread: it touches only win32/psutil, never Tkinter."""
-    global _running
+    global _running, _monitor_paused
     logger.critical("[kiosk] RECOVERY CHORD accepted — exiting kiosk WITHOUT password.")
+    # Park the monitor first so it stops fighting for focus / can't relaunch the
+    # target while we tear it down, THEN signal shutdown (R1).
+    _monitor_paused = True
     _running = False
     try:
         if _target_hwnd:
@@ -738,8 +747,10 @@ def handle_emergency():
         accepted = bool(password_attempt) and verify_password(password_attempt, EXIT_PASSWORD_HASH)
         if accepted:
             _running = False
-        else:
-            # Staying in kiosk mode -> restore the target window's TOPMOST state
+        elif _running:
+            # Staying in kiosk mode -> restore the target window's TOPMOST state.
+            # (_running may already be False if the recovery chord fired while
+            # this dialog was open — in that case skip; we're shutting down.)
             if _target_hwnd and win32gui.IsWindow(_target_hwnd) and _original_target_topmost:
                 try:
                     win32gui.SetWindowPos(_target_hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
@@ -792,6 +803,11 @@ def monitor_loop():
         refresh_target_family()
 
         if _target_proc is None or (_target_proc and _target_proc.poll() is not None):
+            # A concurrent shutdown (recovery chord / emergency exit) may have
+            # just nulled _target_proc. Re-check _running so we don't relaunch
+            # the target we're trying to kill, leaving an orphan process (R1).
+            if not _running:
+                break
             p = start_target()
             if p is None:
                 logger.error("[kiosk] Could not start target. Retrying in 1 seconds.")
